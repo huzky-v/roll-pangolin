@@ -1,6 +1,6 @@
 # Roll Pangolin
 
-This is a helper Docker Container which helps to deploy [Pangolin Reverse Proxy](https://github.com/fosrl/pangolin) with the help of Docker Labels.  
+This is a helper Docker Container which helps to deploy [Pangolin Reverse Proxy](https://github.com/fosrl/pangolin) setting with the help of Docker Labels.  
 
 ## Usage
 1. Add the label to the stack you want to expose your service (also ensure your container is in the newt network)
