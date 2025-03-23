@@ -1,5 +1,5 @@
 import Docker from "dockerode";
-import net from "net";
+import { parseUrl, fetchAPI, transformLabels } from "./util.js";    
 
 const docker = new Docker({ socketPath: "/var/run/docker.sock" });
 
@@ -11,7 +11,8 @@ const {
     ORGANIZATION = "",
     DEFAULT_SITE = "",
     FORCE_REDEPLOY = "true",
-    GROUPING = ""
+    GROUPING = "",
+    SESSION_TOKEN = ""
 } = process.env;
 
 const shouldRedeploy = FORCE_REDEPLOY === "true";
@@ -25,99 +26,6 @@ const baseDomainData = {};
 const siteData = {};
 const domainData = [];
 
-// Helper function to parse URLs
-const parseUrl = (urlString) => {
-    try {
-        const url = new URL(urlString);
-        const isIp = net.isIP(url.hostname);
-        const hostParts = url.hostname.split(".");
-
-        return {
-            protocol: url.protocol.replace(":", ""),
-            hostname: url.hostname,
-            port: url.port || "default",
-            isIp,
-            subdomain: isIp ? "none" : hostParts.length > 2 ? hostParts.slice(0, -2).join(".") : "none",
-            baseDomain: isIp ? url.hostname : hostParts.slice(-2).join("."),
-        };
-    } catch {
-        console.warn(`⚠️ Invalid URL format: ${urlString}`);
-        return null;
-    }
-};
-
-// Unified API fetch function
-const fetchAPI = async (path, method = "GET", body = null, sessionToken = null, getRaw = false) => {
-    try {
-        const options = {
-            method,
-            headers: {
-                "Content-Type": "application/json",
-                "X-Csrf-Token": "x-csrf-protection"
-            },
-        };
-        if (sessionToken) options.headers.cookie = sessionToken;
-        if (body) options.body = JSON.stringify(body);
-
-        const response = await fetch(`https://${HOST}/api/v1/${path}`, options);
-        return getRaw?response:response.json();
-    } catch (error) {
-        console.error(`❌ API request failed: ${method} ${path}`, error);
-        return null;
-    }
-};
-
-// Retrieve Docker container labels
-const getContainerLabels = async () => {
-    try {
-        const containers = await docker.listContainers({ all: true });
-
-        return containers
-            .filter(({ Labels }) =>
-                Labels["roll-pangolin.destination"] &&
-                Labels["roll-pangolin.enabled"] === "true" &&
-                Labels["roll-pangolin.exposed-path"] &&
-                ((DEFAULT_SITE && Labels["roll-pangolin.site"]) || DEFAULT_SITE !== "") &&
-                (!GROUPING || Labels["roll-pangolin.grouping"])
-            )
-            .map(({ Labels, Names }) => {
-                const parsedDestination = parseUrl(Labels["roll-pangolin.destination"]);
-                const parsedExposedPath = parseUrl(Labels["roll-pangolin.exposed-path"]);
-
-                if (!parsedDestination || !parsedExposedPath) return null;
-
-                const destinationPort = parsedDestination.port === "default"
-                    ? parsedDestination.protocol === "https" ? "443" : "80"
-                    : parsedDestination.port;
-
-                baseDomainData[parsedExposedPath.baseDomain] = "";
-                domainData.push(parsedExposedPath.hostname);
-                return {
-                    site: DEFAULT_SITE || Labels["roll-pangolin.site"],
-                    baseDomain: parsedExposedPath.baseDomain,
-                    resource: {
-                        name: Labels["roll-pangolin.name"] || Names[0],
-                        subdomain: parsedExposedPath.subdomain,
-                        http: true,
-                        protocol: "tcp",
-                        domainId: null,
-                        siteId: null,
-                    },
-                    target: {
-                        ip: parsedDestination.hostname,
-                        port: parseInt(destinationPort, 10),
-                        method: parsedDestination.protocol,
-                        enabled: true,
-                    },
-                };
-            })
-            .filter(Boolean);
-    } catch (error) {
-        console.error("❌ Error fetching container labels:", error);
-        return [];
-    }
-};
-
 // Login and get session cookie
 const loginUserAndGetSessionCookie = async () => {
     const result = await fetchAPI(`auth/login`, "POST", { email: EMAIL, password: PASSWORD }, null, true);
@@ -130,9 +38,68 @@ const loginUserAndGetSessionCookie = async () => {
     }
 };
 
+// Retrieve Docker container labels
+const getContainerLabels = async () => {
+    try {
+        const containers = await docker.listContainers({ all: true });
+
+        return containers.filter(({ Labels }) => {
+                return Object.keys(Labels).some((item) => item.startsWith("roll-pangolin")) //filter out all that is not roll-pangolin target
+            })
+            .map(({Labels}) => transformLabels(Labels)) // Transform all Labels 
+            .filter((item) => {
+                // Filters the container that does not fill in the required field
+                return item.destination &&
+                item.enabled === "true" &&
+                item.exposedPath &&
+                item.name &&
+                ((DEFAULT_SITE && item.site) || DEFAULT_SITE !== "") &&
+                (!GROUPING || item.grouping)
+            })
+            .map(({destination, exposedPath, name, site, ssoPlatformEnabled, password, pincode}) => {
+                const parsedDestination = parseUrl(destination);
+                const parsedExposedPath = parseUrl(exposedPath);
+
+                if (!parsedDestination || !parsedExposedPath) return null;
+
+                const destinationPort = parsedDestination.port === "default"
+                    ? parsedDestination.protocol === "https" ? "443" : "80"
+                    : parsedDestination.port;
+
+                baseDomainData[parsedExposedPath.baseDomain] = "";
+                domainData.push(parsedExposedPath.hostname);
+                return {
+                    site: DEFAULT_SITE || site,
+                    baseDomain: parsedExposedPath.baseDomain,
+                    resource: {
+                        name,
+                        subdomain: parsedExposedPath.subdomain,
+                        http: true,
+                        protocol: "tcp",
+                        domainId: null, //get from later api call to obtain domainId
+                        siteId: null, //get from later api call to obtain siteId
+                    },
+                    target: {
+                        ip: parsedDestination.hostname,
+                        port: parseInt(destinationPort, 10),
+                        method: parsedDestination.protocol,
+                        enabled: true,
+                    },
+                    ssoPlatformEnabled,
+                    password,
+                    pincode
+                };
+            });
+    } catch (error) {
+        console.error("❌ Error fetching container labels:", error);
+        return [];
+    }
+};
+
 // Main function
 const deployResources = async () => {
-    const sessionToken = await loginUserAndGetSessionCookie();
+    
+    const sessionToken = (SESSION_TOKEN) ? SESSION_TOKEN : await loginUserAndGetSessionCookie(); // If there is a session token provided, use the session token, otherwise use email/password 
     const resourceList = await getContainerLabels();
 
     if (shouldRedeploy) {
@@ -176,8 +143,14 @@ const deployResources = async () => {
             if (!resourceId) continue;
 
             await fetchAPI(`resource/${resourceId}/target`, "PUT", resourceItem.target, sessionToken);
+
+            if (resourceItem.password) await fetchAPI(`resource/${resourceId}/password`, "POST", { password: resourceItem.password }, sessionToken);
+            if (resourceItem.pincode) await fetchAPI(`resource/${resourceId}/pincode`, "POST", { pincode: resourceItem.pincode }, sessionToken);
+            if (resourceItem.ssoPlatformEnabled === "false") await fetchAPI(`resource/${resourceId}/pincode`, "POST", { sso: false }, sessionToken);
+
             console.log(`✅ Created resource: ${resourceItem.resource.name}`);
-        } catch (error) {
+
+        } catch (error) { 
             console.error(`❌ Error creating resource: ${resourceItem.resource.name}`, error);
         }
     }
